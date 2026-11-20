@@ -11,10 +11,21 @@ public final class HighlightGradient {
     private final int nearColor, middleColor, farColor;
     // At most 64 patches per input polygon; avoid unbounded work near entities.
     private static final int MAX_DEPTH = 3;
+    private static final int TARGET_PATCH_BUDGET = 2048;
+    private final int maxDepth;
     private static final double COLOR_STEP = 1.0 / 24.0;
 
     private HighlightGradient(List<Vec3[]> polygons, Vec3 camera) {
         this.camera = camera;
+        int depth = 0;
+        long patches = polygons.size();
+        while (depth < MAX_DEPTH && patches > 0 && patches * 4 <= TARGET_PATCH_BUDGET) {
+            patches *= 4;
+            depth++;
+        }
+        // Complex occlusion already supplies a dense mesh. Do not multiply
+        // every tiny fragment by 64; preserve all original fragments and holes.
+        maxDepth = depth;
         nearColor = BriefestBoxerConfig.multicolorNearColor();
         middleColor = BriefestBoxerConfig.multicolorMiddleColor();
         farColor = BriefestBoxerConfig.multicolorFarColor();
@@ -50,7 +61,7 @@ public final class HighlightGradient {
     }
 
     private boolean split(Vec3[] polygon, int depth) {
-        if (depth >= MAX_DEPTH) return false;
+        if (depth >= maxDepth || (nearColor == middleColor && middleColor == farColor)) return false;
         double max = 0.0;
         for (Vec3 p : polygon) max = Math.max(max, p.distanceSquared(camera));
         // Include the interior minimum: a face's nearest point may be in its

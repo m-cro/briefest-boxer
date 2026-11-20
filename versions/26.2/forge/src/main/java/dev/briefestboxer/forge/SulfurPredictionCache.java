@@ -6,7 +6,6 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.world.entity.monster.cubemob.SulfurCube;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.function.Supplier;
@@ -19,10 +18,10 @@ final class SulfurPredictionCache {
     private Trajectory path;
 
     Trajectory get(Minecraft client, SulfurCube cube, ItemStack bodyItem, ItemStack heldItem,
-            float charge, AABB bounds, Supplier<Trajectory> calculate) {
+            float charge, SulfurSyncedState.Start start, Supplier<Trajectory> calculate) {
         var player = client.player;
         Inputs current = new Inputs(cube, player, client.level.getGameTime(), cube.tickCount, player.tickCount,
-                cube.position(), cube.getDeltaMovement(), bounds, cube.onGround(),
+                cube.position(), cube.getDeltaMovement(), start, cube.onGround(),
                 player.position(), player.getEyePosition(), player.getLookAngle(), charge,
                 player.fallDistance, player.onGround(), player.isSprinting(), player.onClimbable(),
                 player.isInWater(), player.isMobilityRestricted(), player.isPassenger(),
@@ -52,7 +51,7 @@ final class SulfurPredictionCache {
     }
 
     private record Inputs(Object cube, Object player, long worldTick, int cubeTick, int playerTick,
-            Vec3 cubePosition, Vec3 velocity, AABB bounds, boolean grounded,
+            Vec3 cubePosition, Vec3 velocity, SulfurSyncedState.Start start, boolean grounded,
             Vec3 playerPosition, Vec3 eye, Vec3 look, float charge, double fallDistance,
             boolean playerGrounded, boolean sprinting, boolean climbing, boolean water,
             boolean restricted, boolean passenger, int steps, PhysicsAttributes attributes) {}

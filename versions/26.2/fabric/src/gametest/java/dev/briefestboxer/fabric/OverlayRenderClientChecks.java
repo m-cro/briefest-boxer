@@ -53,22 +53,22 @@ final class OverlayRenderClientChecks {
             return Trajectory.freeFlight(new dev.briefestboxer.core.Vec3(0, 0, 0),
                     new dev.briefestboxer.core.Vec3(0, 0, 0), new dev.briefestboxer.core.Vec3(0, 0, 0), 1, 1);
         };
-        var first = cache.get(client, cube, body, sword, 1.0F, cube.getBoundingBox(), calculate);
+        var first = cache.get(client, cube, body, sword, 1.0F, SulfurSyncedState.Start.current(cube, cube.getBoundingBox()), calculate);
         cube.xOld -= 1.0; // Render movement must not rerun identical physics.
-        var repeated = cache.get(client, cube, body, sword, 1.0F, cube.getBoundingBox(), calculate);
+        var repeated = cache.get(client, cube, body, sword, 1.0F, SulfurSyncedState.Start.current(cube, cube.getBoundingBox()), calculate);
         if (first != repeated || calculations[0] != 1) throw new AssertionError("Forecast was not reused");
-        cache.get(client, cube, body, new ItemStack(Items.WOODEN_SWORD), 1.0F, cube.getBoundingBox(), calculate);
+        cache.get(client, cube, body, new ItemStack(Items.WOODEN_SWORD), 1.0F, SulfurSyncedState.Start.current(cube, cube.getBoundingBox()), calculate);
         if (calculations[0] != 2) throw new AssertionError("Held item did not invalidate forecast");
-        cache.get(client, cube, body, sword, 0.5F, cube.getBoundingBox(), calculate);
+        cache.get(client, cube, body, sword, 0.5F, SulfurSyncedState.Start.current(cube, cube.getBoundingBox()), calculate);
         if (calculations[0] != 3) throw new AssertionError("Attack charge did not invalidate forecast");
         cube.setDeltaMovement(new Vec3(0.1, 0.0, 0.0));
-        cache.get(client, cube, body, sword, 0.5F, cube.getBoundingBox(), calculate);
+        cache.get(client, cube, body, sword, 0.5F, SulfurSyncedState.Start.current(cube, cube.getBoundingBox()), calculate);
         if (calculations[0] != 4) throw new AssertionError("Cube movement did not invalidate forecast");
         cube.getAttribute(Attributes.GRAVITY).setBaseValue(0.05);
-        cache.get(client, cube, body, sword, 0.5F, cube.getBoundingBox(), calculate);
+        cache.get(client, cube, body, sword, 0.5F, SulfurSyncedState.Start.current(cube, cube.getBoundingBox()), calculate);
         if (calculations[0] != 5) throw new AssertionError("Cube attributes did not invalidate forecast");
         cube.tickCount++;
-        cache.get(client, cube, body, sword, 0.5F, cube.getBoundingBox(), calculate);
+        cache.get(client, cube, body, sword, 0.5F, SulfurSyncedState.Start.current(cube, cube.getBoundingBox()), calculate);
         if (calculations[0] != 6) throw new AssertionError("New tick did not invalidate forecast");
         System.out.println("[Briefest Boxer GameTest] Overlay matches vanilla at five frame fractions; "
                 + "gizmos drain once and forecast cache invalidation passed");

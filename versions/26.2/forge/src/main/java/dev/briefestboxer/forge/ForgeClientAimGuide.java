@@ -37,10 +37,19 @@ public final class ForgeClientAimGuide {
     private static boolean submittedThisFrame;
     private static int selectedEntityId = -1;
     private static final SulfurPredictionCache predictionCache = new SulfurPredictionCache();
+    private static final SulfurSyncedState syncedState = new SulfurSyncedState();
     private static final long TRAJECTORY_MISS_GRACE_NANOS = 100_000_000L;
     private static final EntityTargetGrace<SulfurCube> trajectoryTargetGrace = new EntityTargetGrace<>();
 
     private ForgeClientAimGuide() {}
+
+    /** Packets are handled between client ticks; sample synced cube state there. */
+    @SubscribeEvent
+    public static void onClientTickStart(TickEvent.ClientTickEvent.Pre event) {
+        Minecraft client = Minecraft.getInstance();
+        if (client.level == null) syncedState.clear();
+        else syncedState.beforeTick(client.level);
+    }
 
     @SubscribeEvent
     public static void onClientTick(TickEvent.ClientTickEvent.Post event) {
@@ -49,8 +58,10 @@ public final class ForgeClientAimGuide {
             selectedEntityId = -1;
             trajectoryTargetGrace.clear();
             predictionCache.clear();
+            syncedState.clear();
             return;
         }
+        syncedState.afterTick(client.level);
         if (!configLoaded) {
             BriefestBoxerConfig.load(client.gameDirectory.toPath());
             configLoaded = true;
@@ -110,6 +121,9 @@ public final class ForgeClientAimGuide {
                     || entity == viewer || !entity.isAlive() || entity.isSpectator() || entity.isInvisible()) continue;
             if (!EntityHighlightFilters.enabled(entity.getType())) continue;
             AABB box = hittableBounds(entity, renderPartialTick(client, entity));
+            // Off-screen targets must not consume the finite highlight slots.
+            // Use a conservative margin to avoid popping at the screen edge.
+            if (!client.gameRenderer.mainCamera().getCullFrustum().isVisible(box.inflate(0.05))) continue;
             double distance = EntityHighlightSelector.distanceSquared(coreCamera, bounds(box));
             if (distance <= radiusSquared) candidates.add(new TargetDistance(entity, box, distance));
         }
@@ -278,12 +292,14 @@ public final class ForgeClientAimGuide {
         float charge = client.player.getAttackStrengthScale(0.5F);
         AABB renderBounds = interpolatedBounds(cube, renderPartialTick(client, cube));
         Vec3 renderCenter = renderBounds.getCenter();
-        AABB startingBounds = cube.getBoundingBox();
-        Vec3 center = startingBounds.getCenter();
-        Vec3 renderOffset = renderCenter.subtract(center);
+        // Start from the server's state at attack time, not the lagging,
+        // interpolated client copy with its stale, client-decayed velocity.
+        SulfurSyncedState.Start start = syncedState.start(cube);
         SulfurCube targetCube = cube;
-        Trajectory path = predictionCache.get(client, cube, bodyItem, weapon, charge, startingBounds,
-                () -> calculateSulfurTrajectory(client, targetCube, bodyItem, weapon, charge, startingBounds));
+        Trajectory path = predictionCache.get(client, cube, bodyItem, weapon, charge, start,
+                () -> calculateSulfurTrajectory(client, targetCube, bodyItem, weapon, charge, start));
+        // Draw the ribbon from the visible cube to the predicted hit-time path.
+        Vec3 renderOffset = renderCenter.subtract(gameVec(path.getPositions().getFirst()));
 
         int pathColor = 0xFF000000 | BriefestBoxerConfig.trajectoryColor();
         renderTrajectoryRibbon(client, path, renderOffset, BriefestBoxerConfig.trajectoryColor());
@@ -308,7 +324,7 @@ public final class ForgeClientAimGuide {
             // Smooth the starting point with the visible cube, while keeping
             // future collision/landing coordinates anchored to the world.
             Vec3 from = gameVec(positions.getFirst()).add(renderOffset);
-            for (int i = 1; i < positions.size(); i++) {
+            for (int i = 1; i <= path.getLastMovingSampleIndex(); i++) {
                 Vec3 to = gameVec(positions.get(i));
                 if (from.distanceToSqr(to) > 1.0E-12) primitives.addLine(from, to, color, 2.0F);
                 from = to;
@@ -317,15 +333,13 @@ public final class ForgeClientAimGuide {
     }
 
     private static Trajectory calculateSulfurTrajectory(Minecraft client, SulfurCube cube,
-            ItemStack bodyItem, ItemStack weapon, float charge, AABB physicsBounds) {
-        final SulfurCube targetCube = cube;
-        List<SulfurCubeArchetype> archetypes = cube.matchingArchetypes(bodyItem);
+            ItemStack bodyItem, ItemStack weapon, float charge, SulfurSyncedState.Start start) {
         float unscaledDamage = (float) effectiveAttribute(client.player, weapon, net.minecraft.world.entity.EquipmentSlot.MAINHAND, Attributes.ATTACK_DAMAGE);
-        float enchantmentDamage = (enchantmentValue(weapon,
+        var damageSource = weapon.getDamageSource(client.player);
+        float enchantmentDamage = (ClientEnchantmentValues.apply(weapon, cube, damageSource,
                 net.minecraft.world.item.enchantment.EnchantmentEffectComponents.DAMAGE, unscaledDamage)
                 - unscaledDamage) * charge;
         float baseDamage = unscaledDamage * (0.2F + charge * charge * 0.8F);
-        var damageSource = weapon.getDamageSource(client.player);
         boolean fullStrength = charge > 0.9F;
         double weaponBonus = weapon.getItem().getAttackDamageBonus(cube, baseDamage, damageSource);
         double damage = Math.max(0.0, baseDamage + weaponBonus);
@@ -336,78 +350,23 @@ public final class ForgeClientAimGuide {
                 && net.minecraft.world.item.MaceItem.canSmashAttack(client.player)) {
             // MaceItem only adds Density on ServerLevel; reproduce the synced
             // fall-distance effect here for the client forecast.
-            weaponBonus += enchantmentValue(weapon,
+            weaponBonus += ClientEnchantmentValues.apply(weapon, cube, damageSource,
                     net.minecraft.world.item.enchantment.EnchantmentEffectComponents.SMASH_DAMAGE_PER_FALLEN_BLOCK,
                     0.0F) * client.player.fallDistance;
             damage = Math.max(0.0, baseDamage + weaponBonus);
         }
         if (critical) damage *= 1.5;
         damage = Math.max(0.0, damage + enchantmentDamage);
-        // Empty cubes use LivingEntity.hurtServer, which applies armor after the
-        // attack's critical modifier. An absorbed cube overrides hurtServer and
-        // directly invokes its knockback path, so armor does not reduce the hit.
-        if (bodyItem.isEmpty()) {
-            damage = net.minecraft.world.damagesource.CombatRules.getDamageAfterAbsorb(cube,
-                    (float) damage, damageSource,
-                    (float) effectiveCubeAttribute(cube, bodyItem, archetypes, Attributes.ARMOR),
-                    (float) effectiveCubeAttribute(cube, bodyItem, archetypes, Attributes.ARMOR_TOUGHNESS));
-        }
         // Apply the synced enchantment value effects in the same order as
         // LivingEntity.getKnockback, then add Player.attack's sprint bonus.
-        double extraKnockback = enchantmentValue(weapon,
+        double extraKnockback = ClientEnchantmentValues.apply(weapon, cube, damageSource,
                 net.minecraft.world.item.enchantment.EnchantmentEffectComponents.KNOCKBACK,
                 (float) effectiveAttribute(client.player, weapon, net.minecraft.world.entity.EquipmentSlot.MAINHAND, Attributes.ATTACK_KNOCKBACK))
                 * 0.5 + (client.player.isSprinting() && fullStrength ? 0.5 : 0.0);
-        return SulfurMovementForecast.calculate(cube, bodyItem, physicsBounds, client.player,
+        return SulfurMovementForecast.calculate(cube, bodyItem, start, client.player,
                 damageSource, (float) damage, extraKnockback, BriefestBoxerConfig.trajectorySteps);
     }
 
-    /** Client-safe value effects from the server's synchronized enchantment registry. */
-    private static float enchantmentValue(ItemStack weapon,
-            net.minecraft.core.component.DataComponentType<java.util.List<net.minecraft.world.item.enchantment.ConditionalEffect<net.minecraft.world.item.enchantment.effects.EnchantmentValueEffect>>> component,
-            float value) {
-        var enchantments = weapon.getOrDefault(net.minecraft.core.component.DataComponents.ENCHANTMENTS,
-                net.minecraft.world.item.enchantment.ItemEnchantments.EMPTY);
-        var random = net.minecraft.util.RandomSource.create(0L);
-        for (var entry : enchantments.entrySet()) {
-            for (var effect : entry.getKey().value().getEffects(component)) {
-                // Vanilla Sharpness, Knockback and Density are unconditional.
-                // Target-filtered effects such as Smite do not apply to sulfur
-                // cubes. Server-only loot predicates cannot be evaluated here.
-                if (effect.requirements().isEmpty()) {
-                    value = effect.effect().process(entry.getIntValue(), random, value);
-                }
-            }
-        }
-        return value;
-    }
-
-    /** Includes the absorbed material's matching Sulfur Cube archetype modifiers. */
-    private static double effectiveCubeAttribute(SulfurCube cube, ItemStack bodyItem,
-            List<SulfurCubeArchetype> archetypes,
-            net.minecraft.core.Holder<net.minecraft.world.entity.ai.attributes.Attribute> attribute) {
-        var current = cube.getAttribute(attribute);
-        var effective = new net.minecraft.world.entity.ai.attributes.AttributeInstance(attribute, ignored -> {});
-        effective.setBaseValue(current.getBaseValue());
-        for (var modifier : current.getModifiers()) effective.addTransientModifier(modifier);
-        var itemModifiers = bodyItem.getOrDefault(net.minecraft.core.component.DataComponents.ATTRIBUTE_MODIFIERS,
-                net.minecraft.world.item.component.ItemAttributeModifiers.EMPTY);
-        itemModifiers.forEach(net.minecraft.world.entity.EquipmentSlot.BODY, (modifiedAttribute, modifier) -> {
-            if (modifiedAttribute.equals(attribute)) {
-                effective.addOrUpdateTransientModifier(modifier);
-            }
-        });
-        for (SulfurCubeArchetype archetype : archetypes) {
-            for (var entry : archetype.attributeModifiers()) {
-                if (entry.attribute().equals(attribute)) {
-                    effective.addOrUpdateTransientModifier(entry.modifier());
-                }
-            }
-        }
-        return effective.getValue();
-    }
-
-    /** Uses held weapon modifiers if the server's equipment attribute update is pending. */
     private static double effectiveAttribute(net.minecraft.world.entity.LivingEntity player, ItemStack weapon,
             net.minecraft.world.entity.EquipmentSlot slot,
             net.minecraft.core.Holder<net.minecraft.world.entity.ai.attributes.Attribute> attribute) {

@@ -23,8 +23,9 @@ import java.util.EnumMap;
 final class SulfurMovementForecast extends SulfurCube {
     private final SulfurCube source;
 
-    private SulfurMovementForecast(SulfurCube source, ItemStack body, AABB bounds) {
+    private SulfurMovementForecast(SulfurCube source, ItemStack body, SulfurSyncedState.Start start) {
         super(EntityTypes.SULFUR_CUBE, source.level());
+        AABB bounds = start.bounds();
         this.source = source;
         setSize(source.getSize(), false);
         setPos(bounds.getCenter().x, bounds.minY, bounds.getCenter().z);
@@ -32,6 +33,10 @@ final class SulfurMovementForecast extends SulfurCube {
         setSilent(true);
         setNoGravity(source.isNoGravity());
         setSprinting(source.isSprinting());
+        setPose(source.getPose());
+        fallDistance = source.fallDistance;
+        wasTouchingWater = source.isInWater();
+        firstTick = false;
         for (var effect : source.getActiveEffects()) addEffect(new net.minecraft.world.effect.MobEffectInstance(effect));
         getAttributes().assignAllValues(source.getAttributes());
         // Body equipment and attribute packets can arrive separately. Remove
@@ -49,42 +54,35 @@ final class SulfurMovementForecast extends SulfurCube {
         // Initializes the game's private archetype power and buoyancy fields,
         // and applies the same material attributes as normal equipment updates.
         collectEquipmentChanges(previous);
-        setOnGround(source.onGround());
+        setOnGround(start.onGround());
         mainSupportingBlockPos = source.mainSupportingBlockPos;
-        tickCount = source.tickCount;
-        setDeltaMovement(source.getDeltaMovement());
+        // Buoyant cubes bob with sin(tickCount); start from the server's
+        // estimated count so the catch-up ticks end on the attack's tick.
+        tickCount = start.tickCount() - start.catchUpTicks();
+        setDeltaMovement(start.velocity());
     }
 
-    static Trajectory calculate(SulfurCube source, ItemStack body, AABB bounds,
+    static Trajectory calculate(SulfurCube source, ItemStack body, SulfurSyncedState.Start start,
             Player attacker, DamageSource damageSource, float damage, double bonusKnockback, int steps) {
-        var forecast = new SulfurMovementForecast(source, body, bounds);
-        forecast.knockback(0.4F, attacker.getX() - forecast.getX(), attacker.getZ() - forecast.getZ(),
+        var forecast = new SulfurMovementForecast(source, body, start);
+        // Bring the last synced server state forward to the tick the hit lands on.
+        int restingTicks = 0;
+        for (int tick = 0; tick < start.catchUpTicks() && restingTicks < 3; tick++) {
+            restingTicks = forecast.step() ? restingTicks + 1 : 0;
+        }
+        if (damage > 0.0F) forecast.knockback(0.4F, attacker.getX() - forecast.getX(), attacker.getZ() - forecast.getZ(),
                 damageSource, damage, false);
-        if (bonusKnockback > 0.0) {
+        if (damage > 0.0F && bonusKnockback > 0.0) {
             double yaw = attacker.getYRot() * ((float) Math.PI / 180.0F);
             forecast.knockback(bonusKnockback, net.minecraft.util.Mth.sin(yaw), -net.minecraft.util.Mth.cos(yaw),
                     damageSource, damage, true);
         }
         var positions = new ArrayList<dev.briefestboxer.core.Vec3>(steps + 1);
         forecast.addPosition(positions);
-        int restingTicks = 0;
+        restingTicks = 0;
         for (int tick = 0; tick < steps; tick++) {
-            Vec3 previousCenter = forecast.getBoundingBox().getCenter();
-            forecast.tickCount++;
-            // Only fluid sampling and travel are invoked. No entity tick, AI,
-            // damage, block effects, spawning or world registration occurs.
-            forecast.updateFluidInteraction();
-            Vec3 velocity = forecast.getDeltaMovement();
-            forecast.setDeltaMovement(Math.abs(velocity.x) < 0.003 ? 0.0 : velocity.x,
-                    Math.abs(velocity.y) < 0.003 ? 0.0 : velocity.y,
-                    Math.abs(velocity.z) < 0.003 ? 0.0 : velocity.z);
-            forecast.travel(Vec3.ZERO);
+            boolean atRest = forecast.step();
             forecast.addPosition(positions);
-            Vec3 remaining = forecast.getDeltaMovement();
-            boolean atRest = !forecast.isInWater() && !forecast.isInLava()
-                    && forecast.onGround() && remaining.y <= 0.0
-                    && remaining.horizontalDistanceSqr() < 1.0E-12
-                    && previousCenter.distanceToSqr(forecast.getBoundingBox().getCenter()) < 1.0E-12;
             restingTicks = atRest ? restingTicks + 1 : 0;
             if (restingTicks >= 3) {
                 // Keep the requested sample count without simulating thousands
@@ -95,6 +93,37 @@ final class SulfurMovementForecast extends SulfurCube {
             }
         }
         return Trajectory.fromPositions(positions);
+    }
+
+    /** Simulates movement with no hit, for fitting synced states. */
+    static SulfurSyncedState.Snapshot advance(SulfurCube source, ItemStack body,
+            SulfurSyncedState.Start start, int ticks) {
+        var forecast = new SulfurMovementForecast(source, body, start);
+        for (int tick = 0; tick < ticks; tick++) forecast.step();
+        return new SulfurSyncedState.Snapshot(forecast.position(), forecast.getDeltaMovement(), forecast.onGround());
+    }
+
+    /** Advances one server tick of movement; returns whether the cube is at rest. */
+    private boolean step() {
+        Vec3 previousCenter = getBoundingBox().getCenter();
+        tickCount++;
+        setOldPosAndRot();
+        wasInPowderSnow = isInPowderSnow;
+        isInPowderSnow = false;
+        // Sample fluids before travel, then process swept block contacts in
+        // the same order as LivingEntity.aiStep. Never run AI or entity ticks.
+        updateFluidInteraction();
+        Vec3 velocity = getDeltaMovement();
+        setDeltaMovement(Math.abs(velocity.x) < 0.003 ? 0.0 : velocity.x,
+                Math.abs(velocity.y) < 0.003 ? 0.0 : velocity.y,
+                Math.abs(velocity.z) < 0.003 ? 0.0 : velocity.z);
+        travel(Vec3.ZERO);
+        applyEffectsFromBlocks();
+        Vec3 remaining = getDeltaMovement();
+        return !isInWater() && !isInLava()
+                && onGround() && remaining.y <= 0.0
+                && remaining.horizontalDistanceSqr() < 1.0E-12
+                && previousCenter.distanceToSqr(getBoundingBox().getCenter()) < 1.0E-12;
     }
 
     private void addPosition(ArrayList<dev.briefestboxer.core.Vec3> positions) {

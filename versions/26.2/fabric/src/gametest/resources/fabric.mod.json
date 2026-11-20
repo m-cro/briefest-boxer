@@ -6,7 +6,8 @@
   "environment": "client",
   "entrypoints": {
     "fabric-client-gametest": [
-      "dev.briefestboxer.fabric.SulfurTrajectoryClientGameTest"
+      "dev.briefestboxer.fabric.SulfurTrajectoryClientGameTest",
+      "dev.briefestboxer.fabric.SulfurMultiplayerClientGameTest"
     ]
   },
   "depends": {

@@ -7,9 +7,13 @@ import java.util.List;
 /** Immutable sampled path. Samples are in world coordinates, one per game tick. */
 public final class Trajectory {
     private final List<Vec3> positions;
+    private final int lastMovingSampleIndex;
 
     private Trajectory(List<Vec3> positions) {
         this.positions = Collections.unmodifiableList(positions);
+        int end = positions.size() - 1;
+        while (end > 0 && positions.get(end).distanceSquared(positions.get(end - 1)) <= 1.0E-12) end--;
+        lastMovingSampleIndex = end;
     }
 
     /** Copies samples produced by a version's native movement implementation. */
@@ -21,6 +25,9 @@ public final class Trajectory {
     public List<Vec3> getPositions() {
         return positions;
     }
+
+    /** Omits the stationary tail when drawing; tick samples remain unchanged. */
+    public int getLastMovingSampleIndex() { return lastMovingSampleIndex; }
 
     public interface GroundSampler {
         Surface sample(double x, double y, double z);

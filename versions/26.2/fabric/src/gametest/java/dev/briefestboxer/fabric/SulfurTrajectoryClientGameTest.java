@@ -143,6 +143,100 @@ public final class SulfurTrajectoryClientGameTest implements FabricClientGameTes
 
             context.waitTicks(40);
             connection.waitForClientboundPackets();
+            // The overlay runs on the lagging, interpolated client copy of a moving
+            // cube whose velocity is only refreshed by sync packets. Hit a cube in
+            // mid-flight at several sync phases without zeroing anything, using the
+            // forecast exactly as the overlay builds it. The final case hits a cube
+            // that has rested long enough for the client to decay its synced
+            // velocity; nothing on the client copy is modified in any case.
+            for (int hitDelay : new int[] {2, 3, 4, 6, 8, 80}) {
+                boolean resting = hitDelay >= 60;
+                if (!resting) singleplayer.getServer().computeOnServer(server -> {
+                    var cube = (SulfurCube) singleplayer.getConnection().getServerLevel().getEntity(cubeId);
+                    cube.setDeltaMovement(new Vec3(0.0, 0.5, 0.12));
+                    return null;
+                });
+                context.waitTicks(hitDelay);
+                float[] look = new float[2];
+                Trajectory[] liveCopyPrediction = new Trajectory[1];
+                Trajectory movingPrediction = context.computeOnClient(client -> {
+                    SulfurCube cube = findCube(client, cubeId);
+                    client.player.setPos(2.5, -58.0, 0.5);
+                    client.player.setDeltaMovement(Vec3.ZERO);
+                    // Players aim at the cube they can see: the interpolated copy.
+                    aimAt(client.player, cube);
+                    look[0] = client.player.getYRot();
+                    look[1] = client.player.getXRot();
+                    // What a forecast from the live client copy would show, for the log.
+                    liveCopyPrediction[0] = BriefestBoxerClient.calculateSulfurTrajectory(client, cube,
+                            cube.getItemBySlot(EquipmentSlot.BODY), client.player.getWeaponItem(),
+                            client.player.getAttackStrengthScale(0.5F), cube.getBoundingBox());
+                    return BriefestBoxerClient.calculateSulfurTrajectory(client, cube,
+                            cube.getItemBySlot(EquipmentSlot.BODY), client.player.getWeaponItem(),
+                            client.player.getAttackStrengthScale(0.5F), BriefestBoxerClient.syncedStart(cube));
+                });
+                AttackResult movingAttack = singleplayer.getServer().computeOnServer(server -> {
+                    var cube = (SulfurCube) singleplayer.getConnection().getServerLevel().getEntity(cubeId);
+                    Player player = singleplayer.getConnection().getServerPlayer();
+                    player.setPos(2.5, -58.0, 0.5);
+                    player.setDeltaMovement(Vec3.ZERO);
+                    player.setYRot(look[0]);
+                    player.setXRot(look[1]);
+                    Vec3 centerAtHit = cube.getBoundingBox().getCenter();
+                    String state = describe(player, cube) + ", centerAtHit=" + centerAtHit;
+                    player.attack(cube);
+                    return new AttackResult(cube.getDeltaMovement(), state,
+                            java.util.List.of(new MotionSample(centerAtHit, cube.getDeltaMovement(), cube.onGround(),
+                                    0.0, 0.0, 0.0, level(singleplayer).getGameTime())));
+                });
+                var hitStart = movingPrediction.getPositions().get(0);
+                var hitNext = movingPrediction.getPositions().get(1);
+                Vec3 predictedStart = new Vec3(hitStart.x, hitStart.y, hitStart.z);
+                Vec3 predictedLaunch = new Vec3(hitNext.x - hitStart.x, hitNext.y - hitStart.y, hitNext.z - hitStart.z);
+                double startError = predictedStart.distanceTo(movingAttack.path().getFirst().center());
+                double launchError = predictedLaunch.distanceTo(movingAttack.velocity());
+                if (startError > 0.02 || launchError > 0.02) {
+                    throw new AssertionError("Mid-flight Sulfur Cube hit forecast (delay " + hitDelay
+                            + ") mismatch: predicted start " + predictedStart + ", launch " + predictedLaunch
+                            + "; actual " + movingAttack.state() + ", launch " + movingAttack.velocity()
+                            + "; startError=" + startError + ", launchError=" + launchError);
+                }
+                StringBuilder movingTrace = new StringBuilder();
+                for (int tick = 1; tick <= 12; tick++) {
+                    context.waitTicks(1);
+                    Vec3 actual = singleplayer.getServer().computeOnServer(server ->
+                            ((SulfurCube) level(singleplayer).getEntity(cubeId)).getBoundingBox().getCenter());
+                    var expected = movingPrediction.getPositions().get(tick);
+                    double error = actual.distanceTo(new Vec3(expected.x, expected.y, expected.z));
+                    movingTrace.append(tick).append(": expected=").append(expected.x).append(',')
+                            .append(expected.y).append(',').append(expected.z).append(" actual=").append(actual).append("; ");
+                    if (error > 0.10) {
+                        throw new AssertionError("Mid-flight Sulfur Cube hit path (delay " + hitDelay
+                                + ") diverged at tick " + tick + ", error " + error + "; trace=" + movingTrace);
+                    }
+                }
+                System.out.println("[Briefest Boxer GameTest] " + (resting ? "Resting" : "Mid-flight")
+                        + " hit forecast matched (delay " + hitDelay
+                        + "): startError=" + startError + ", launchError=" + launchError
+                        + "; live-copy forecast would err start="
+                        + new Vec3(liveCopyPrediction[0].getPositions().get(0).x, liveCopyPrediction[0].getPositions().get(0).y,
+                                liveCopyPrediction[0].getPositions().get(0).z).distanceTo(movingAttack.path().getFirst().center())
+                        + ", launch=" + new Vec3(liveCopyPrediction[0].getPositions().get(1).x - liveCopyPrediction[0].getPositions().get(0).x,
+                                liveCopyPrediction[0].getPositions().get(1).y - liveCopyPrediction[0].getPositions().get(0).y,
+                                liveCopyPrediction[0].getPositions().get(1).z - liveCopyPrediction[0].getPositions().get(0).z)
+                                .distanceTo(movingAttack.velocity()));
+                // Return the cube to its resting launch spot for the next case.
+                singleplayer.getServer().computeOnServer(server -> {
+                    var cube = (SulfurCube) level(singleplayer).getEntity(cubeId);
+                    cube.setPos(0.5, -58.0, 2.5);
+                    cube.setDeltaMovement(Vec3.ZERO);
+                    return null;
+                });
+                context.waitTicks(20);
+                connection.waitForClientboundPackets();
+            }
+            context.waitTicks(40);
+            connection.waitForClientboundPackets();
 
             String[] clientState = new String[1];
             Trajectory prediction = context.computeOnClient(client -> {
@@ -392,14 +486,23 @@ public final class SulfurTrajectoryClientGameTest implements FabricClientGameTes
             connection.waitForClientboundPackets();
 
             Vec3[] waterServerStart = new Vec3[1];
+            int[] waterServerTickCount = new int[1];
             singleplayer.getServer().computeOnServer(server -> {
                 SulfurCube cube = (SulfurCube) singleplayer.getConnection().getServerLevel().getEntity(waterCubeId);
                 waterServerStart[0] = cube.getBoundingBox().getCenter();
+                waterServerTickCount[0] = cube.tickCount;
                 return null;
             });
 
             Trajectory waterPrediction = context.computeOnClient(client -> {
                 SulfurCube cube = findCube(client, waterCubeId);
+                // Buoyant cubes bob with sin(tickCount), which the server never
+                // syncs. The overlay's singleplayer estimate must match the server.
+                int estimatedTickCount = BriefestBoxerClient.syncedStart(cube).tickCount();
+                if (estimatedTickCount != waterServerTickCount[0]) {
+                    throw new AssertionError("Singleplayer tickCount estimate " + estimatedTickCount
+                            + " != server " + waterServerTickCount[0] + " (client " + cube.tickCount + ")");
+                }
                 // Client entity interpolation can lag the authoritative cube by a
                 // fraction of a block. Align the test predictor with the exact server
                 // origin so this assertion measures physics, not packet interpolation.
@@ -412,7 +515,8 @@ public final class SulfurTrajectoryClientGameTest implements FabricClientGameTes
                 client.hitResult = new EntityHitResult(cube, cube.getBoundingBox().getCenter());
                 return BriefestBoxerClient.calculateSulfurTrajectory(client, cube,
                         cube.getItemBySlot(EquipmentSlot.BODY), client.player.getWeaponItem(),
-                        client.player.getAttackStrengthScale(0.5F), cube.getBoundingBox());
+                        client.player.getAttackStrengthScale(0.5F), new SulfurSyncedState.Start(cube.getBoundingBox(),
+                                cube.getDeltaMovement(), cube.onGround(), 0, estimatedTickCount));
             });
             AttackResult waterAttack = singleplayer.getServer().computeOnServer(server -> {
                 var level = singleplayer.getConnection().getServerLevel();
@@ -687,6 +791,16 @@ public final class SulfurTrajectoryClientGameTest implements FabricClientGameTes
                         + ", upper=" + highAimOakLogLaunch);
             }
 
+            // Exercise the multiplayer-only path (bobbing phase fitted from syncs)
+            // over this connection by ignoring the integrated server.
+            SulfurSyncedState.useIntegratedServer = false;
+            try {
+                SulfurMultiplayerClientGameTest.floatingHit(context, singleplayer.getServer(),
+                        singleplayer.getConnection(), "Synced-only (integrated server ignored)");
+            } finally {
+                SulfurSyncedState.useIntegratedServer = true;
+            }
+
             context.computeOnClient(client -> {
                 if (!ModMenu.hasConfigScreen("briefest_boxer")) {
                     throw new AssertionError("Mod Menu did not register Briefest Boxer's configuration screen");
@@ -694,8 +808,8 @@ public final class SulfurTrajectoryClientGameTest implements FabricClientGameTes
                 var screen = ModMenu.getConfigScreen("briefest_boxer", null);
                 if (screen == null) throw new AssertionError("Mod Menu returned no Briefest Boxer config screen");
                 client.setScreenAndShow(screen);
-                if (screen.children().size() != 9) {
-                    throw new AssertionError("Briefest Boxer config screen should expose 9 controls, got "
+                if (screen.children().size() != 15) {
+                    throw new AssertionError("Briefest Boxer config screen should expose 15 controls, got "
                             + screen.children().size());
                 }
                 return null;
@@ -755,6 +869,10 @@ public final class SulfurTrajectoryClientGameTest implements FabricClientGameTes
         if (cube.getSize() != 2 || cube.isBaby()) {
             throw new AssertionError("Trajectory fixture must be an adult size-2 Sulfur Cube");
         }
+    }
+
+    private static net.minecraft.server.level.ServerLevel level(TestSingleplayerContext singleplayer) {
+        return singleplayer.getConnection().getServerLevel();
     }
 
     private static void aimAt(Player player, SulfurCube cube) {

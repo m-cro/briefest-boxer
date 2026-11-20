@@ -27,26 +27,44 @@ final class EntityHighlightFilters {
         types.sort(java.util.Comparator.comparing(type -> type.getDescription().getString()));
         return types;
     }
-    static void setGroup(int group, boolean enabled, List<EntityType<?>> types) {
-        if (group == 0) BriefestBoxerConfig.showAimPoints = enabled;
-        else {
-            if (enabled) BriefestBoxerConfig.showEntities = true;
-            if (group == 1) BriefestBoxerConfig.showFriendlyMobs = enabled;
-            else BriefestBoxerConfig.showHostileMobs = enabled;
+    private static void openGroup(int group) {
+        if (group == 0) {
+            BriefestBoxerConfig.showAimPoints = true;
+            return;
         }
+        // Opening one group must not revive the other group after the master
+        // mob switch had hidden both of them.
+        if (!BriefestBoxerConfig.showEntities) {
+            BriefestBoxerConfig.showFriendlyMobs = false;
+            BriefestBoxerConfig.showHostileMobs = false;
+        }
+        BriefestBoxerConfig.showEntities = true;
+        if (group == 1) BriefestBoxerConfig.showFriendlyMobs = true;
+        else BriefestBoxerConfig.showHostileMobs = true;
+    }
+
+    static void setGroup(int group, boolean enabled, List<EntityType<?>> types) {
+        if (enabled) openGroup(group);
+        else if (group == 0) BriefestBoxerConfig.showAimPoints = false;
+        else if (group == 1) BriefestBoxerConfig.showFriendlyMobs = false;
+        else BriefestBoxerConfig.showHostileMobs = false;
         for (EntityType<?> type : types) {
             if (group(type) == group) BriefestBoxerConfig.setEntityTypeEnabled(id(type), enabled);
         }
     }
+
     static void setType(EntityType<?> type, boolean enabled) {
         if (enabled) {
             int group = group(type);
-            if (group == 0) BriefestBoxerConfig.showAimPoints = true;
-            else {
-                BriefestBoxerConfig.showEntities = true;
-                if (group == 1) BriefestBoxerConfig.showFriendlyMobs = true;
-                else BriefestBoxerConfig.showHostileMobs = true;
+            // Materialize the disabled group's previous choices before opening
+            // its gate, so selecting one type cannot select every sibling.
+            if (!enabled(type)) {
+                for (EntityType<?> sibling : livingTypes()) {
+                    if (group(sibling) == group && !enabled(sibling))
+                        BriefestBoxerConfig.setEntityTypeEnabled(id(sibling), false);
+                }
             }
+            openGroup(group);
         }
         BriefestBoxerConfig.setEntityTypeEnabled(id(type), enabled);
     }

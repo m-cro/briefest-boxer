@@ -138,7 +138,7 @@ public final class BriefestBoxerModMenu implements ModMenuApi {
         @Override
         protected void applyValue() {
             BriefestBoxerConfig.hitboxOpacity = (int) Math.round(value * 100.0);
-            BriefestBoxerConfig.save();
+            // The parent screen saves on close; dragging must not do disk I/O.
         }
     }
 
@@ -158,7 +158,7 @@ public final class BriefestBoxerModMenu implements ModMenuApi {
         @Override
         protected void applyValue() {
             BriefestBoxerConfig.multicolorSmoothness = (int) Math.round(value * 100.0);
-            BriefestBoxerConfig.save();
+            // The parent screen saves on close; dragging must not do disk I/O.
         }
     }
 
@@ -243,13 +243,15 @@ public final class BriefestBoxerModMenu implements ModMenuApi {
             search.setHint(Component.literal("Search entities…"));
             search.setValue(query);
             search.setResponder(value -> {
+                int cursor = search.getCursorPosition();
                 query = value;
                 page = 0;
                 rebuildWidgets();
                 // Keep typing in the recreated search field.
                 for (var child : children()) if (child instanceof EditBox edit) {
                     setFocused(edit);
-                    edit.setCursorPosition(edit.getValue().length());
+                    edit.setCursorPosition(Math.min(cursor, edit.getValue().length()));
+                    edit.setHighlightPos(edit.getCursorPosition());
                     break;
                 }
             });

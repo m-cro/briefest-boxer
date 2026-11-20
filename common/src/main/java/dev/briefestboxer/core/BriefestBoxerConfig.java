@@ -50,6 +50,7 @@ public final class BriefestBoxerConfig {
     private BriefestBoxerConfig() {}
 
     public static void load(Path gameDirectory) {
+        resetDefaults();
         file = gameDirectory.resolve("config").resolve("briefest_boxer.properties");
         if (Files.isRegularFile(file)) {
             Properties values = new Properties();
@@ -89,10 +90,29 @@ public final class BriefestBoxerConfig {
                 selectedColor = colorIndex(values, "selectedColor", 0);
                 otherColor = colorIndex(values, "otherColor", 0);
                 trajectoryColor = colorIndex(values, "trajectoryColor", 2);
-            } catch (IOException ignored) {
+            } catch (IOException | IllegalArgumentException ignored) {
                 // Defaults remain active when a user config cannot be read.
             }
         }
+    }
+
+    private static void resetDefaults() {
+        showAimPoints = showEntities = showFriendlyMobs = showHostileMobs = showSulfurTrajectory = true;
+        showPartiallyObscuredHitboxes = multicolorHighlights = false;
+        aimRange = 32;
+        maxHighlightedEntities = 4;
+        hitboxOpacity = 50;
+        multicolorSmoothness = 100;
+        multicolorNearColor = 0;
+        multicolorMiddleColor = 1;
+        multicolorFarColor = 2;
+        aimTolerance = 4;
+        trajectorySteps = 4096;
+        selectedColor = otherColor = 0;
+        trajectoryColor = 2;
+        selectedColorRgb = otherColorRgb = trajectoryColorRgb = -1;
+        multicolorNearRgb = multicolorMiddleRgb = multicolorFarRgb = -1;
+        disabledEntityTypes.clear();
     }
 
     public static void save() {
@@ -128,13 +148,25 @@ public final class BriefestBoxerConfig {
         values.setProperty("selectedColor", Integer.toString(selectedColor));
         values.setProperty("otherColor", Integer.toString(otherColor));
         values.setProperty("trajectoryColor", Integer.toString(trajectoryColor));
+        Path temporary = null;
         try {
             Files.createDirectories(file.getParent());
-            try (OutputStream out = Files.newOutputStream(file)) {
+            temporary = Files.createTempFile(file.getParent(), "briefest_boxer.", ".tmp");
+            try (OutputStream out = Files.newOutputStream(temporary)) {
                 values.store(out, "Briefest Boxer client settings");
             }
+            try {
+                Files.move(temporary, file, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
+                Files.move(temporary, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (IOException ignored) {
-            // A failed save should not stop the client from playing.
+            // Keep the previous configuration intact when writing fails.
+        } finally {
+            if (temporary != null) {
+                try { Files.deleteIfExists(temporary); } catch (IOException ignored) {}
+            }
         }
     }
 
