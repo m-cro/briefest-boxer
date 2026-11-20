@@ -50,6 +50,11 @@ public final class BriefestBoxerClient implements ClientModInitializer {
             if (client.level == null) syncedState.clear();
             else syncedState.beforeTick(client.level);
         });
+        // The integrated server (singleplayer) runs this on its own thread.
+        net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents.START_SERVER_TICK
+                .register(SulfurSyncedState::markIntegratedTickStart);
+        net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents.END_SERVER_TICK
+                .register(SulfurSyncedState::captureIntegrated);
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client.level != null) syncedState.afterTick(client.level);
         });

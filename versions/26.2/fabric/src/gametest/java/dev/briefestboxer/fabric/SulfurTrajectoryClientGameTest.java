@@ -26,6 +26,8 @@ import net.minecraft.world.phys.Vec3;
 public final class SulfurTrajectoryClientGameTest implements FabricClientGameTest {
     @Override
     public void runTest(ClientGameTestContext context) {
+        // These tests step client and server in lockstep; see SulfurSyncedState.
+        SulfurSyncedState.serverRunsOnWallClock = false;
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
             var connection = singleplayer.getConnection();
             connection.waitForChunksRender();

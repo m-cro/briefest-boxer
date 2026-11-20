@@ -7,6 +7,7 @@ import net.fabricmc.fabric.api.client.gametest.v1.context.TestDedicatedServerCon
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestDedicatedServerContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestServerConnection;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestServerContext;
+import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.EntitySpawnReason;
@@ -45,6 +46,143 @@ public final class SulfurMultiplayerClientGameTest implements FabricClientGameTe
                 throw new AssertionError("Dedicated-server test unexpectedly has an integrated server");
             }
             floatingHit(context, server, connection, "Dedicated-server");
+            for (int delay : new int[] {1, 3}) laggyHit(context, server, connection, delay);
+        }
+    }
+
+    /**
+     * Holds every clientbound packet for {@code delay} ticks and lands the attack
+     * {@code delay} ticks after the forecast, like a connection with a round trip
+     * of {@code 2 * delay} ticks, then checks the ping-compensated forecast.
+     */
+    private static void laggyHit(ClientGameTestContext context, TestServerContext server,
+            TestDedicatedServerConnection connection, int delay) {
+        int cubeId = server.computeOnServer(minecraftServer -> {
+            var level = connection.getServerLevel();
+            var player = connection.getServerPlayer();
+            player.teleportTo(X + 0.5, -58.0, 18.5);
+            SulfurCube cube = EntityTypes.SULFUR_CUBE.create(level, EntitySpawnReason.COMMAND);
+            cube.setBaby(false);
+            cube.setSize(2, true);
+            if (!cube.equipItem(new ItemStack(Blocks.OAK_LOG))) throw new AssertionError("Oak log was rejected");
+            cube.getGoalSelector().removeAllGoals(goal -> true);
+            cube.setPos(X + 0.5, -58.0, 21.5);
+            if (!level.addFreshEntity(cube)) throw new AssertionError("Sulfur Cube spawn was rejected");
+            return cube.getId();
+        });
+        context.waitTicks(40);
+        connection.waitForClientboundPackets();
+        PacketDelay lag = context.computeOnClient(client -> PacketDelay.install(client, delay));
+        try {
+            server.runOnServer(minecraftServer -> ((SulfurCube) connection.getServerLevel().getEntity(cubeId))
+                    .setDeltaMovement(new Vec3(0.0, 0.5, 0.1)));
+            for (int tick = 0; tick < delay + 3; tick++) {
+                context.waitTicks(1);
+                lag.advance();
+            }
+            float[] look = new float[2];
+            Trajectory[] uncompensated = new Trajectory[1];
+            Trajectory prediction = context.computeOnClient(client -> {
+                SulfurCube cube = (SulfurCube) client.level.getEntity(cubeId);
+                client.player.setPos(X + 0.5, -58.0, 18.5);
+                client.player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES,
+                        cube.getBoundingBox().getCenter());
+                look[0] = client.player.getYRot();
+                look[1] = client.player.getXRot();
+                ItemStack body = cube.getItemBySlot(EquipmentSlot.BODY);
+                float charge = client.player.getAttackStrengthScale(0.5F);
+                try {
+                    SulfurSyncedState.latencyOverrideMs = 0;
+                    uncompensated[0] = BriefestBoxerClient.calculateSulfurTrajectory(client, cube, body,
+                            client.player.getWeaponItem(), charge, BriefestBoxerClient.syncedStart(cube));
+                    SulfurSyncedState.latencyOverrideMs = 2 * delay * 50;
+                    return BriefestBoxerClient.calculateSulfurTrajectory(client, cube, body,
+                            client.player.getWeaponItem(), charge, BriefestBoxerClient.syncedStart(cube));
+                } finally {
+                    SulfurSyncedState.latencyOverrideMs = null;
+                }
+            });
+            // The attack packet also spends the one-way delay in flight.
+            for (int tick = 0; tick < delay; tick++) {
+                context.waitTicks(1);
+                lag.advance();
+            }
+            Hit hit = server.computeOnServer(minecraftServer -> {
+                var cube = (SulfurCube) connection.getServerLevel().getEntity(cubeId);
+                var player = connection.getServerPlayer();
+                player.setPos(X + 0.5, -58.0, 18.5);
+                player.setYRot(look[0]);
+                player.setXRot(look[1]);
+                Vec3 center = cube.getBoundingBox().getCenter();
+                player.attack(cube);
+                Hit result = new Hit(cube.tickCount, center, cube.getDeltaMovement());
+                cube.discard();
+                return result;
+            });
+            double[] errors = launchErrors(prediction, hit);
+            double[] without = launchErrors(uncompensated[0], hit);
+            if (errors[0] > 0.02 || errors[1] > 0.02) {
+                throw new AssertionError("Ping-compensated hit (" + (2 * delay * 50) + " ms) mismatch: startError="
+                        + errors[0] + ", launchError=" + errors[1] + "; uncompensated start="
+                        + without[0] + ", launch=" + without[1]);
+            }
+            System.out.println("[Briefest Boxer GameTest] " + (2 * delay * 50) + " ms round-trip hit matched: startError="
+                    + errors[0] + ", launchError=" + errors[1] + " (without ping compensation: start="
+                    + without[0] + ", launch=" + without[1] + ")");
+        } finally {
+            context.runOnClient(client -> lag.remove());
+            context.waitTicks(5);
+        }
+    }
+
+    private static double[] launchErrors(Trajectory path, Hit hit) {
+        var first = path.getPositions().get(0);
+        var second = path.getPositions().get(1);
+        return new double[] {
+                new Vec3(first.x, first.y, first.z).distanceTo(hit.center()),
+                new Vec3(second.x - first.x, second.y - first.y, second.z - first.z).distanceTo(hit.velocity())};
+    }
+
+    /** Holds decoded clientbound packets on the Netty event loop for a number of advances. */
+    private static final class PacketDelay extends io.netty.channel.ChannelInboundHandlerAdapter {
+        private final int delay;
+        private final java.util.ArrayDeque<Object[]> held = new java.util.ArrayDeque<>();
+        private io.netty.channel.ChannelHandlerContext context;
+        private long now;
+
+        private PacketDelay(int delay) { this.delay = delay; }
+
+        static PacketDelay install(Minecraft client, int delay) {
+            try {
+                var field = net.minecraft.network.Connection.class.getDeclaredField("channel");
+                field.setAccessible(true);
+                var channel = (io.netty.channel.Channel) field.get(client.getConnection().getConnection());
+                var handler = new PacketDelay(delay);
+                channel.pipeline().addBefore("packet_handler", "briefest_boxer_test_delay", handler);
+                return handler;
+            } catch (ReflectiveOperationException e) {
+                throw new AssertionError("Could not reach the client connection channel", e);
+            }
+        }
+
+        @Override public void handlerAdded(io.netty.channel.ChannelHandlerContext ctx) { context = ctx; }
+
+        @Override public void channelRead(io.netty.channel.ChannelHandlerContext ctx, Object message) {
+            held.add(new Object[] {now, message});
+        }
+
+        void advance() {
+            context.executor().execute(() -> {
+                now++;
+                while (!held.isEmpty() && (long) held.peek()[0] + delay <= now) context.fireChannelRead(held.poll()[1]);
+            });
+        }
+
+        void remove() {
+            context.executor().execute(() -> {
+                while (!held.isEmpty()) context.fireChannelRead(held.poll()[1]);
+                context.pipeline().remove(this);
+            });
         }
     }
 

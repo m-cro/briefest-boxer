@@ -22,9 +22,16 @@ import java.util.WeakHashMap;
  * synced state as packets arrive (before the client tick mutates it) and let the
  * forecast simulate the elapsed ticks with native physics before applying the hit.
  *
+ * <p>In singleplayer the integrated server ticks on its own thread, so packet
+ * timing does not pin down which server tick a click lands on. There, the cube's
+ * state is snapshotted on the server thread after each tick. A click is handled at
+ * the start of the next client tick, and the attack lands on the newest server
+ * state at that moment, so the snapshot is advanced by the server ticks expected
+ * to finish before then.
+ *
  * <p>Buoyant cubes also bob with {@code sin(tickCount)}, and the server never
- * syncs {@code tickCount}. In singleplayer it is read from the integrated server;
- * in multiplayer it is fitted from consecutive syncs of a floating cube.
+ * syncs {@code tickCount}. In singleplayer the snapshot carries it; in
+ * multiplayer it is fitted from consecutive syncs of a floating cube.
  */
 final class SulfurSyncedState {
     /**
@@ -45,6 +52,10 @@ final class SulfurSyncedState {
     private static final int MAX_PHASE_FIT_TICKS = 12;
     /** Test hook: ignore the integrated server, as on a multiplayer connection. */
     static boolean useIntegratedServer = true;
+    /** Test hook: lockstep game tests step the server themselves, so its clock means nothing. */
+    static boolean serverRunsOnWallClock = true;
+    /** Test hook: replaces the server-reported round-trip latency, in milliseconds. */
+    static Integer latencyOverrideMs;
 
     /**
      * Server state at the last sync, the ticks needed to bring it to attack time,
@@ -64,6 +75,21 @@ final class SulfurSyncedState {
 
     /** {@code ticksBefore} counts the client ticks that had started when the sync arrived. */
     private record Synced(Snapshot state, long ticksBefore) {}
+
+    private record ServerState(Vec3 position, Vec3 velocity, boolean onGround, int tickCount) {}
+    /** Replaced wholesale by the integrated server thread; never mutated in place. */
+    private static volatile Map<java.util.UUID, ServerState> integratedStates = Map.of();
+    /** Server ticks started, and the started count when the snapshot was taken. */
+    private static volatile long startedTicks, snapshotTicks;
+    private static volatile long tickStartNanos, serverTickNanos = 50_000_000L;
+    /**
+     * The server's own schedule for its next tick start, on the game's
+     * {@code Util.getNanos()} clock. 26.2 ships unobfuscated, so the name is
+     * stable; if it can't be read, the tick length is assumed.
+     */
+    private static final java.lang.reflect.Field NEXT_TICK_TIME = nextTickTimeField();
+    private static final long CLIENT_TICK_NANOS = 50_000_000L;
+    private static final double SNAPSHOT_RANGE = 64.0;
 
     private final Map<SulfurCube, Snapshot> afterLastTick = new WeakHashMap<>();
     private final Map<SulfurCube, Synced> synced = new WeakHashMap<>();
@@ -95,7 +121,78 @@ final class SulfurSyncedState {
         }
     }
 
+    /** Integrated server thread, before each tick. */
+    static void markIntegratedTickStart(net.minecraft.server.MinecraftServer server) {
+        if (!(server instanceof net.minecraft.client.server.IntegratedServer)) return;
+        tickStartNanos = net.minecraft.util.Util.getNanos();
+        startedTicks++;
+    }
+
+    private static java.lang.reflect.Field nextTickTimeField() {
+        try {
+            var field = net.minecraft.server.MinecraftServer.class.getDeclaredField("nextTickTimeNanos");
+            field.setAccessible(true);
+            return field;
+        } catch (ReflectiveOperationException | RuntimeException unavailable) {
+            return null;
+        }
+    }
+
+    /** Integrated server thread, after each tick: snapshot cubes near players. */
+    static void captureIntegrated(net.minecraft.server.MinecraftServer server) {
+        // A test's dedicated server can share this JVM; only read our own world.
+        if (!(server instanceof net.minecraft.client.server.IntegratedServer)) return;
+        var states = new java.util.HashMap<java.util.UUID, ServerState>();
+        for (var player : server.getPlayerList().getPlayers()) {
+            for (SulfurCube cube : player.level().getEntitiesOfClass(SulfurCube.class,
+                    player.getBoundingBox().inflate(SNAPSHOT_RANGE))) {
+                states.put(cube.getUUID(), new ServerState(cube.position(), cube.getDeltaMovement(),
+                        cube.onGround(), cube.tickCount));
+            }
+        }
+        serverTickNanos = Math.max(1L, server.tickRateManager().nanosecondsPerTick());
+        integratedStates = states;
+        snapshotTicks = startedTicks;
+    }
+
+    /**
+     * Server ticks the click will wait for: a tick already running when it
+     * arrives, plus every tick the server schedules to start before the click is
+     * handled at the next client tick. A server running late has its schedule in
+     * the past and catches up back to back, which the schedule also captures.
+     */
+    private int integratedTicksBeforeClick() {
+        var client = Minecraft.getInstance();
+        var server = client.getSingleplayerServer();
+        // A frozen tick rate (/tick freeze) runs no ticks on its own.
+        if (!serverRunsOnWallClock || server == null || server.tickRateManager().isFrozen()) return 0;
+        long running = Math.max(0, startedTicks - snapshotTicks);
+        long nextStart = tickStartNanos + serverTickNanos;
+        if (NEXT_TICK_TIME != null) {
+            try {
+                nextStart = NEXT_TICK_TIME.getLong(server);
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+                // Keep the assumed schedule.
+            }
+        }
+        long now = net.minecraft.util.Util.getNanos();
+        // The frame's partial tick says how far off the next client tick is,
+        // including when the client is behind and runs ticks back to back.
+        float partial = client.getDeltaTracker().getGameTimeDeltaPartialTick(true);
+        long click = now + (long) ((1.0F - Math.min(1.0F, Math.max(0.0F, partial))) * CLIENT_TICK_NANOS);
+        long scheduled = click < nextStart ? 0 : 1 + (click - nextStart) / serverTickNanos;
+        return (int) Math.min(MAX_CATCH_UP_TICKS, running + scheduled);
+    }
+
     Start start(SulfurCube cube) {
+        if (integrated()) {
+            ServerState server = integratedStates.get(cube.getUUID());
+            if (server != null) {
+                AABB bounds = cube.getBoundingBox().move(server.position().subtract(cube.position()));
+                int ahead = integratedTicksBeforeClick();
+                return new Start(bounds, server.velocity(), server.onGround(), ahead, server.tickCount() + ahead);
+            }
+        }
         Snapshot live = Snapshot.of(cube);
         Synced last = synced.get(cube);
         // Frames can render after packets are handled but before the next tick
@@ -111,8 +208,6 @@ final class SulfurSyncedState {
 
     /** Estimated server tickCount when the attack lands, {@code hitTick} in sync-tick terms. */
     private int hitTickCount(SulfurCube cube, long hitTick) {
-        Integer integrated = integratedTickCount(cube);
-        if (integrated != null) return integrated;
         Long fitted = phase.get(cube);
         // Without a fit the phase is unknown; the client count is as good as any.
         return fitted != null ? (int) (hitTick + fitted) : cube.tickCount;
@@ -123,28 +218,13 @@ final class SulfurSyncedState {
     }
 
     /**
-     * Singleplayer: read the integrated server's cube. Entity IDs are shared and an
-     * int read is atomic; a lookup that races the server thread just falls back.
-     */
-    private static Integer integratedTickCount(SulfurCube cube) {
-        if (!integrated()) return null;
-        try {
-            var serverLevel = Minecraft.getInstance().getSingleplayerServer().getLevel(cube.level().dimension());
-            Entity serverCube = serverLevel == null ? null : serverLevel.getEntity(cube.getId());
-            return serverCube instanceof SulfurCube && serverCube.getUUID().equals(cube.getUUID())
-                    ? serverCube.tickCount : null;
-        } catch (RuntimeException concurrentLookup) {
-            return null;
-        }
-    }
-
-    /**
      * The sync and the attack each cross the network once, so a remote server
      * resolves the hit about one round trip of ticks later than a local one.
      */
     private static int pingTicks() {
         var client = Minecraft.getInstance();
         if (client.getSingleplayerServer() != null || client.getConnection() == null || client.player == null) return 0;
+        if (latencyOverrideMs != null) return Math.max(0, Math.round(latencyOverrideMs / 50.0F));
         var info = client.getConnection().getPlayerInfo(client.player.getUUID());
         return info == null ? 0 : Math.max(0, Math.round(info.getLatency() / 50.0F));
     }
@@ -187,6 +267,7 @@ final class SulfurSyncedState {
     }
 
     void clear() {
+        integratedStates = Map.of();
         afterLastTick.clear();
         synced.clear();
         phase.clear();

@@ -43,6 +43,17 @@ public final class ForgeClientAimGuide {
 
     private ForgeClientAimGuide() {}
 
+    /** The integrated server (singleplayer) posts these on its own thread. */
+    @SubscribeEvent
+    public static void onServerTickStart(TickEvent.ServerTickEvent.Pre event) {
+        SulfurSyncedState.markIntegratedTickStart(event.server());
+    }
+
+    @SubscribeEvent
+    public static void onServerTick(TickEvent.ServerTickEvent.Post event) {
+        SulfurSyncedState.captureIntegrated(event.server());
+    }
+
     /** Packets are handled between client ticks; sample synced cube state there. */
     @SubscribeEvent
     public static void onClientTickStart(TickEvent.ClientTickEvent.Pre event) {
@@ -332,7 +343,11 @@ public final class ForgeClientAimGuide {
         }).setAlwaysOnTop();
     }
 
-    private static Trajectory calculateSulfurTrajectory(Minecraft client, SulfurCube cube,
+    static SulfurSyncedState.Start syncedStart(SulfurCube cube) {
+        return syncedState.start(cube);
+    }
+
+    static Trajectory calculateSulfurTrajectory(Minecraft client, SulfurCube cube,
             ItemStack bodyItem, ItemStack weapon, float charge, SulfurSyncedState.Start start) {
         float unscaledDamage = (float) effectiveAttribute(client.player, weapon, net.minecraft.world.entity.EquipmentSlot.MAINHAND, Attributes.ATTACK_DAMAGE);
         var damageSource = weapon.getDamageSource(client.player);
