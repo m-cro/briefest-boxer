@@ -41,9 +41,16 @@ esac
 
 existing='[]'
 if [[ "$dry_run" != 1 ]]; then
-    # Authenticated so draft and unlisted projects are visible.
-    existing="$(curl -sSf -A "$user_agent" -H "Authorization: $MODRINTH_TOKEN" \
-        "$api/project/$project/version" | jq '[.[].version_number]')"
+    # Reading a draft project's versions needs the token's "Read versions" scope.
+    # Without it Modrinth answers 404; carry on and let the upload report errors.
+    lookup="$(curl -sS -A "$user_agent" -w '\n%{http_code}' -H "Authorization: $MODRINTH_TOKEN" \
+        "$api/project/$project/version")"
+    if [[ "${lookup##*$'\n'}" == 200 ]]; then
+        existing="$(jq '[.[].version_number]' <<<"${lookup%$'\n'*}")"
+    else
+        printf '::warning::Could not list existing Modrinth versions (HTTP %s); already-uploaded versions will not be skipped. Give the token the "Read versions" scope.\n' \
+            "${lookup##*$'\n'}"
+    fi
 fi
 
 shopt -s nullglob
