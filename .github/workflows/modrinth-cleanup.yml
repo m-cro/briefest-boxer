@@ -1,0 +1,36 @@
+name: Remove split Modrinth versions
+
+# One-off cleanup: deletes the per-jar Modrinth versions (numbered like
+# 0.2.0+1.21.1-fabric) that an earlier release run created. Leaves the combined
+# version (numbered 0.2.0) alone.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release whose split versions to delete
+        required: true
+        default: 0.2.0
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete split versions
+        env:
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          MODRINTH_PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
+          RELEASE: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          api=https://api.modrinth.com/v2
+          ua="briefest-boxer-release-ci (github.com/$GITHUB_REPOSITORY)"
+          versions="$(curl -sSf -A "$ua" -H "Authorization: $MODRINTH_TOKEN" "$api/project/$MODRINTH_PROJECT_ID/version")"
+          mapfile -t targets < <(jq -r --arg p "$RELEASE+" '.[] | select(.version_number | startswith($p)) | "\(.id) \(.version_number)"' <<<"$versions")
+          echo "Deleting ${#targets[@]} versions:"
+          for t in "${targets[@]}"; do
+            id="${t%% *}"
+            echo "  ${t#* }"
+            curl -sSf -A "$ua" -X DELETE -H "Authorization: $MODRINTH_TOKEN" "$api/version/$id"
+          done
+          echo "Done."
