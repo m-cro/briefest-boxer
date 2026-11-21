@@ -41,7 +41,9 @@ esac
 
 existing='[]'
 if [[ "$dry_run" != 1 ]]; then
-    existing="$(curl -sSf -A "$user_agent" "$api/project/$project/version" | jq '[.[].version_number]')"
+    # Authenticated so draft and unlisted projects are visible.
+    existing="$(curl -sSf -A "$user_agent" -H "Authorization: $MODRINTH_TOKEN" \
+        "$api/project/$project/version" | jq '[.[].version_number]')"
 fi
 
 shopt -s nullglob
