@@ -67,10 +67,21 @@ final class OverlayRenderClientChecks {
         cube.getAttribute(Attributes.GRAVITY).setBaseValue(0.05);
         cache.get(client, cube, body, sword, 0.5F, SulfurSyncedState.Start.current(cube, cube.getBoundingBox()), calculate);
         if (calculations[0] != 5) throw new AssertionError("Cube attributes did not invalidate forecast");
+        // A cube resting on the ground: a new tick alone must not rerun physics.
+        cube.setDeltaMovement(Vec3.ZERO);
+        cube.setOnGround(true);
+        cache.get(client, cube, body, sword, 0.5F, SulfurSyncedState.Start.current(cube, cube.getBoundingBox()), calculate);
+        int settled = calculations[0];
         cube.tickCount++;
         cache.get(client, cube, body, sword, 0.5F, SulfurSyncedState.Start.current(cube, cube.getBoundingBox()), calculate);
-        if (calculations[0] != 6) throw new AssertionError("New tick did not invalidate forecast");
+        if (calculations[0] != settled) throw new AssertionError("A resting cube's forecast was recomputed for a new tick");
+        // It still refreshes periodically, so nearby block changes are picked up.
+        long time = client.level.getGameTime();
+        client.level.getLevelData().setGameTime(time + SulfurPredictionCache.REFRESH_TICKS);
+        cache.get(client, cube, body, sword, 0.5F, SulfurSyncedState.Start.current(cube, cube.getBoundingBox()), calculate);
+        client.level.getLevelData().setGameTime(time);
+        if (calculations[0] != settled + 1) throw new AssertionError("A resting cube's forecast never refreshed");
         System.out.println("[Briefest Boxer GameTest] Overlay matches vanilla at five frame fractions; "
-                + "gizmos drain once and forecast cache invalidation passed");
+                + "gizmos drain once and forecast cache reuse/invalidation passed");
     }
 }

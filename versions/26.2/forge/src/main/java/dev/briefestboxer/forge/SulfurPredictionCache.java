@@ -10,8 +10,14 @@ import net.minecraft.world.phys.Vec3;
 
 import java.util.function.Supplier;
 
-/** Reuses a forecast between renders of the same client tick, never its draw pose. */
+/**
+ * Reuses a forecast while nothing that changes it has changed, never its draw
+ * pose. A still cube's start state is keyed on what affects the outcome, so the
+ * forecast is not recomputed 20 times a second for no change; it still refreshes
+ * every {@link #REFRESH_TICKS} ticks so nearby block changes show up.
+ */
 final class SulfurPredictionCache {
+    static final int REFRESH_TICKS = 10;
     private Inputs inputs;
     private ItemStack body = ItemStack.EMPTY;
     private ItemStack weapon = ItemStack.EMPTY;
@@ -20,9 +26,8 @@ final class SulfurPredictionCache {
     Trajectory get(Minecraft client, SulfurCube cube, ItemStack bodyItem, ItemStack heldItem,
             float charge, SulfurSyncedState.Start start, Supplier<Trajectory> calculate) {
         var player = client.player;
-        Inputs current = new Inputs(cube, player, client.level.getGameTime(), cube.tickCount, player.tickCount,
-                cube.position(), cube.getDeltaMovement(), start, cube.onGround(),
-                player.position(), player.getEyePosition(), player.getLookAngle(), charge,
+        Inputs current = new Inputs(cube, player, Math.floorDiv(client.level.getGameTime(), REFRESH_TICKS),
+                SulfurSyncedState.outcomeKey(start), player.position(), player.getEyePosition(), player.getLookAngle(), charge,
                 player.fallDistance, player.onGround(), player.isSprinting(), player.onClimbable(),
                 player.isInWater(), player.isMobilityRestricted(), player.isPassenger(),
                 BriefestBoxerConfig.trajectorySteps,
@@ -50,9 +55,7 @@ final class SulfurPredictionCache {
         weapon = ItemStack.EMPTY;
     }
 
-    private record Inputs(Object cube, Object player, long worldTick, int cubeTick, int playerTick,
-            Vec3 cubePosition, Vec3 velocity, SulfurSyncedState.Start start, boolean grounded,
-            Vec3 playerPosition, Vec3 eye, Vec3 look, float charge, double fallDistance,
+    private record Inputs(Object cube, Object player, long refreshWindow, Object start, Vec3 playerPosition, Vec3 eye, Vec3 look, float charge, double fallDistance,
             boolean playerGrounded, boolean sprinting, boolean climbing, boolean water,
             boolean restricted, boolean passenger, int steps, PhysicsAttributes attributes) {}
 

@@ -22,6 +22,7 @@ import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
+import dev.briefestboxer.core.AimDestination;
 import dev.briefestboxer.core.BriefestBoxerConfig;
 import dev.briefestboxer.core.EntityHighlightSelector;
 import dev.briefestboxer.core.EntityTargetGrace;
@@ -37,7 +38,15 @@ public final class ForgeClientAimGuide {
     private static boolean submittedThisFrame;
     private static int selectedEntityId = -1;
     private static final SulfurPredictionCache predictionCache = new SulfurPredictionCache();
+    private static final SulfurPredictionCache[] alternateCaches = {
+            new SulfurPredictionCache(), new SulfurPredictionCache()};
     private static final SulfurSyncedState syncedState = new SulfurSyncedState();
+    private static final SulfurAimSolver aimSolver = new SulfurAimSolver();
+
+    @SubscribeEvent
+    public static void onRegisterClientCommands(net.minecraftforge.client.event.RegisterClientCommandsEvent event) {
+        SulfurTargetCommand.register(event.getDispatcher());
+    }
     private static final long TRAJECTORY_MISS_GRACE_NANOS = 100_000_000L;
     private static final EntityTargetGrace<SulfurCube> trajectoryTargetGrace = new EntityTargetGrace<>();
 
@@ -68,7 +77,7 @@ public final class ForgeClientAimGuide {
         if (client.player == null || client.level == null) {
             selectedEntityId = -1;
             trajectoryTargetGrace.clear();
-            predictionCache.clear();
+            predictionCache.clear(); clearAlternates();
             syncedState.clear();
             return;
         }
@@ -101,7 +110,7 @@ public final class ForgeClientAimGuide {
         if (client.player == null || client.level == null) {
             selectedEntityId = -1;
             trajectoryTargetGrace.clear();
-            predictionCache.clear();
+            predictionCache.clear(); clearAlternates();
             return;
         }
         // RenderTick.Post queued the previous pose for the next frame. Entity
@@ -109,6 +118,8 @@ public final class ForgeClientAimGuide {
         try (Gizmos.TemporaryCollection ignored = client.levelRenderer.collectPerFrameRenderThreadGizmos()) {
             renderEntityHighlights(client);
             renderSulfurPrediction(client);
+            AimDestination.Target destination = AimDestination.current();
+            if (destination != null) SulfurAimSolver.renderDestination(destination);
         }
     }
 
@@ -278,7 +289,7 @@ public final class ForgeClientAimGuide {
     private static void renderSulfurPrediction(Minecraft client) {
         if (!BriefestBoxerConfig.showSulfurTrajectory) {
             trajectoryTargetGrace.clear();
-            predictionCache.clear();
+            predictionCache.clear(); clearAlternates();
             return;
         }
         long now = System.nanoTime();
@@ -297,7 +308,7 @@ public final class ForgeClientAimGuide {
         } else {
             trajectoryTargetGrace.clear();
         }
-        if (cube == null) { predictionCache.clear(); return; }
+        if (cube == null) { predictionCache.clear(); clearAlternates(); aimSolver.clear(); return; }
         ItemStack bodyItem = cube.getItemBySlot(EquipmentSlot.BODY);
         ItemStack weapon = client.player.getWeaponItem();
         float charge = client.player.getAttackStrengthScale(0.5F);
@@ -321,6 +332,34 @@ public final class ForgeClientAimGuide {
         Gizmos.cuboid(predictedBounds, GizmoStyle.strokeAndFill(pathColor, 2.0F, translucent))
                 .setAlwaysOnTop();
         Gizmos.point(end, pathColor, 12.0F).setAlwaysOnTop();
+        // With a destination set, mark the spots on the cube that land it there.
+        AimDestination.Target destination = AimDestination.current();
+        if (destination == null) {
+            aimSolver.clear();
+        } else {
+            aimSolver.update(client, cube, bodyItem, weapon, charge, start, destination,
+                    aimSolver.frameBudgetNanos());
+            AABB physicsAim = SulfurAimSolver.aimBounds(cube);
+            aimSolver.render(physicsAim.move(renderBounds.getCenter().subtract(cube.getBoundingBox().getCenter())));
+        }
+        // When the click could land on the neighbouring server tick too, show
+        // that outcome faintly so the real path is always on screen.
+        var alternates = syncedState.alternates();
+        for (int i = 0; i < alternateCaches.length; i++) {
+            if (i >= alternates.size()) {
+                alternateCaches[i].clear();
+                continue;
+            }
+            SulfurSyncedState.Start alternate = alternates.get(i);
+            Trajectory other = alternateCaches[i].get(client, cube, bodyItem, weapon, charge, alternate,
+                    () -> calculateSulfurTrajectory(client, targetCube, bodyItem, weapon, charge, alternate));
+            if (SulfurSyncedState.samePath(path, other)) continue;
+            renderTrajectoryRibbon(client, other, renderCenter.subtract(gameVec(other.getPositions().getFirst())),
+                    BriefestBoxerConfig.trajectoryColor(), 0x40);
+            dev.briefestboxer.core.Vec3 otherEnd = other.getPositions().getLast();
+            Gizmos.point(new Vec3(otherEnd.x, otherEnd.y, otherEnd.z), (0x60 << 24) | BriefestBoxerConfig.trajectoryColor(), 8.0F)
+                    .setAlwaysOnTop();
+        }
     }
 
     static boolean isAdultSulfurCube(SulfurCube cube) {
@@ -329,7 +368,11 @@ public final class ForgeClientAimGuide {
 
     /** Use the game's screen-width line primitive so the path remains visible. */
     private static void renderTrajectoryRibbon(Minecraft client, Trajectory path, Vec3 renderOffset, int rgb) {
-        int color = (0x99 << 24) | (rgb & 0xFFFFFF);
+        renderTrajectoryRibbon(client, path, renderOffset, rgb, 0x99);
+    }
+
+    private static void renderTrajectoryRibbon(Minecraft client, Trajectory path, Vec3 renderOffset, int rgb, int alpha) {
+        int color = (alpha << 24) | (rgb & 0xFFFFFF);
         Gizmos.addGizmo((primitives, progress) -> {
             var positions = path.getPositions();
             // Smooth the starting point with the visible cube, while keeping
@@ -347,8 +390,34 @@ public final class ForgeClientAimGuide {
         return syncedState.start(cube);
     }
 
+    /** Alternate starts from the last {@link #syncedStart} call, nearest first. */
+    static java.util.List<SulfurSyncedState.Start> syncedAlternates() {
+        return syncedState.alternates();
+    }
+
+    private static void clearAlternates() {
+        for (SulfurPredictionCache cache : alternateCaches) cache.clear();
+    }
+
+    /** Test hook: the click timing behind the last {@link #syncedStart} call. */
+    static SulfurSyncedState.ClickTiming syncedTiming() {
+        return syncedState.lastTiming();
+    }
+
     static Trajectory calculateSulfurTrajectory(Minecraft client, SulfurCube cube,
             ItemStack bodyItem, ItemStack weapon, float charge, SulfurSyncedState.Start start) {
+        return calculateSulfurTrajectory(client, cube, bodyItem, weapon, charge, start,
+                BriefestBoxerConfig.trajectorySteps);
+    }
+
+    static Trajectory calculateSulfurTrajectory(Minecraft client, SulfurCube cube,
+            ItemStack bodyItem, ItemStack weapon, float charge, SulfurSyncedState.Start start, int steps) {
+        return calculateSulfurTrajectory(client, cube, bodyItem, weapon, charge, start, steps, false);
+    }
+
+    static Trajectory calculateSulfurTrajectory(Minecraft client, SulfurCube cube,
+            ItemStack bodyItem, ItemStack weapon, float charge, SulfurSyncedState.Start start, int steps,
+            boolean stopWhenSettled) {
         float unscaledDamage = (float) effectiveAttribute(client.player, weapon, net.minecraft.world.entity.EquipmentSlot.MAINHAND, Attributes.ATTACK_DAMAGE);
         var damageSource = weapon.getDamageSource(client.player);
         float enchantmentDamage = (ClientEnchantmentValues.apply(weapon, cube, damageSource,
@@ -379,7 +448,7 @@ public final class ForgeClientAimGuide {
                 (float) effectiveAttribute(client.player, weapon, net.minecraft.world.entity.EquipmentSlot.MAINHAND, Attributes.ATTACK_KNOCKBACK))
                 * 0.5 + (client.player.isSprinting() && fullStrength ? 0.5 : 0.0);
         return SulfurMovementForecast.calculate(cube, bodyItem, start, client.player,
-                damageSource, (float) damage, extraKnockback, BriefestBoxerConfig.trajectorySteps);
+                damageSource, (float) damage, extraKnockback, steps, stopWhenSettled);
     }
 
     private static double effectiveAttribute(net.minecraft.world.entity.LivingEntity player, ItemStack weapon,

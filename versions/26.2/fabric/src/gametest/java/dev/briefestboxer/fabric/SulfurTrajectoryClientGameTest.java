@@ -793,6 +793,8 @@ public final class SulfurTrajectoryClientGameTest implements FabricClientGameTes
                         + ", upper=" + highAimOakLogLaunch);
             }
 
+            SulfurAimSolverClientChecks.run(context, singleplayer);
+
             // Exercise the multiplayer-only path (bobbing phase fitted from syncs)
             // over this connection by ignoring the integrated server.
             SulfurSyncedState.useIntegratedServer = false;

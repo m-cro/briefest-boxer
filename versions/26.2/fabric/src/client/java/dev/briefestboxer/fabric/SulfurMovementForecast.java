@@ -64,6 +64,17 @@ final class SulfurMovementForecast extends SulfurCube {
 
     static Trajectory calculate(SulfurCube source, ItemStack body, SulfurSyncedState.Start start,
             Player attacker, DamageSource damageSource, float damage, double bonusKnockback, int steps) {
+        return calculate(source, body, start, attacker, damageSource, damage, bonusKnockback, steps, false);
+    }
+
+    /**
+     * @param stopWhenSettled end as soon as the resting spot is fixed (see
+     *     {@link #settledInPlace}); for callers that only need where the cube
+     *     ends up, not the bounces on the way to rest.
+     */
+    static Trajectory calculate(SulfurCube source, ItemStack body, SulfurSyncedState.Start start,
+            Player attacker, DamageSource damageSource, float damage, double bonusKnockback, int steps,
+            boolean stopWhenSettled) {
         var forecast = new SulfurMovementForecast(source, body, start);
         // Bring the last synced server state forward to the tick the hit lands on.
         int restingTicks = 0;
@@ -84,7 +95,7 @@ final class SulfurMovementForecast extends SulfurCube {
             boolean atRest = forecast.step();
             forecast.addPosition(positions);
             restingTicks = atRest ? restingTicks + 1 : 0;
-            if (restingTicks >= 3) {
+            if (restingTicks >= 3 || (stopWhenSettled && forecast.settledInPlace())) {
                 // Keep the requested sample count without simulating thousands
                 // of identical grounded ticks. Floating cubes keep simulating.
                 var endpoint = positions.getLast();
@@ -101,6 +112,17 @@ final class SulfurMovementForecast extends SulfurCube {
         var forecast = new SulfurMovementForecast(source, body, start);
         for (int tick = 0; tick < ticks; tick++) forecast.step();
         return new SulfurSyncedState.Snapshot(forecast.position(), forecast.getDeltaMovement(), forecast.onGround());
+    }
+
+    /**
+     * Whether the resting spot can no longer change. Each tick LivingEntity.aiStep
+     * zeroes horizontal speed below 0.003, so a grounded, dry cube that slow can
+     * only bounce straight up and down in place and settles exactly here.
+     */
+    private boolean settledInPlace() {
+        Vec3 velocity = getDeltaMovement();
+        return onGround() && !isInWater() && !isInLava()
+                && Math.abs(velocity.x) < 0.003 && Math.abs(velocity.z) < 0.003;
     }
 
     /** Advances one server tick of movement; returns whether the cube is at rest. */

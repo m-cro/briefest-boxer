@@ -77,11 +77,17 @@ final class SulfurSyncedState {
     private record Synced(Snapshot state, long ticksBefore) {}
 
     private record ServerState(Vec3 position, Vec3 velocity, boolean onGround, int tickCount) {}
-    /** Replaced wholesale by the integrated server thread; never mutated in place. */
-    private static volatile Map<java.util.UUID, ServerState> integratedStates = Map.of();
-    /** Server ticks started, and the started count when the snapshot was taken. */
-    private static volatile long startedTicks, snapshotTicks;
+    /**
+     * Cube states plus how many started server ticks they already include.
+     * Published as one immutable object by the integrated server thread.
+     */
+    private record IntegratedSnapshot(Map<java.util.UUID, ServerState> states, long ticksApplied) {}
+    private static volatile IntegratedSnapshot integrated = new IntegratedSnapshot(Map.of(), 0);
+    /** Server ticks started so far. */
+    private static volatile long startedTicks;
     private static volatile long tickStartNanos, serverTickNanos = 50_000_000L;
+    /** Smoothed server tick duration and its typical deviation, for a lagging server. */
+    private static volatile double tickDurationNanos = 2_000_000.0, tickJitterNanos;
     /**
      * The server's own schedule for its next tick start, on the game's
      * {@code Util.getNanos()} clock. 26.2 ships unobfuscated, so the name is
@@ -126,6 +132,23 @@ final class SulfurSyncedState {
         if (!(server instanceof net.minecraft.client.server.IntegratedServer)) return;
         tickStartNanos = net.minecraft.util.Util.getNanos();
         startedTicks++;
+        // Changes applied between ticks (another player's hit, a command) are
+        // visible now, before this tick moves anything: snapshot them, counting
+        // this tick as still to simulate.
+        publish(server, startedTicks - 1);
+    }
+
+    /** Integrated server thread, after each tick: snapshot cubes near players. */
+    static void captureIntegrated(net.minecraft.server.MinecraftServer server) {
+        // A test's dedicated server can share this JVM; only read our own world.
+        if (!(server instanceof net.minecraft.client.server.IntegratedServer)) return;
+        serverTickNanos = Math.max(1L, server.tickRateManager().nanosecondsPerTick());
+        publish(server, startedTicks);
+        double duration = net.minecraft.util.Util.getNanos() - tickStartNanos;
+        if (duration > 0 && duration < 5.0E9) {
+            tickJitterNanos += (Math.abs(duration - tickDurationNanos) - tickJitterNanos) * 0.2;
+            tickDurationNanos += (duration - tickDurationNanos) * 0.2;
+        }
     }
 
     private static java.lang.reflect.Field nextTickTimeField() {
@@ -138,10 +161,7 @@ final class SulfurSyncedState {
         }
     }
 
-    /** Integrated server thread, after each tick: snapshot cubes near players. */
-    static void captureIntegrated(net.minecraft.server.MinecraftServer server) {
-        // A test's dedicated server can share this JVM; only read our own world.
-        if (!(server instanceof net.minecraft.client.server.IntegratedServer)) return;
+    private static void publish(net.minecraft.server.MinecraftServer server, long ticksApplied) {
         var states = new java.util.HashMap<java.util.UUID, ServerState>();
         for (var player : server.getPlayerList().getPlayers()) {
             for (SulfurCube cube : player.level().getEntitiesOfClass(SulfurCube.class,
@@ -150,10 +170,9 @@ final class SulfurSyncedState {
                         cube.onGround(), cube.tickCount));
             }
         }
-        serverTickNanos = Math.max(1L, server.tickRateManager().nanosecondsPerTick());
-        integratedStates = states;
-        snapshotTicks = startedTicks;
+        integrated = new IntegratedSnapshot(states, ticksApplied);
     }
+
 
     /**
      * Server ticks the click will wait for: a tick already running when it
@@ -161,12 +180,30 @@ final class SulfurSyncedState {
      * handled at the next client tick. A server running late has its schedule in
      * the past and catches up back to back, which the schedule also captures.
      */
-    private int integratedTicksBeforeClick() {
+    /**
+     * Clicks this close to a server tick start can land on either side of it:
+     * when the two clocks line up, scheduling noise the client cannot observe
+     * decides. Such clicks also get the neighbouring tick as an alternate.
+     */
+    static final long AMBIGUOUS_NANOS = 10_000_000L;
+
+    /**
+     * Ticks before the click lands, plausible neighbours (one or both sides when
+     * the click is near a tick start), and the margin to the nearest tick start.
+     */
+    record ClickTiming(int ahead, java.util.List<Integer> alternates, long marginNanos) {
+        int alternate() { return alternates.isEmpty() ? -1 : alternates.getFirst(); }
+    }
+
+    private ClickTiming integratedClickTiming(long ticksApplied) {
         var client = Minecraft.getInstance();
         var server = client.getSingleplayerServer();
         // A frozen tick rate (/tick freeze) runs no ticks on its own.
-        if (!serverRunsOnWallClock || server == null || server.tickRateManager().isFrozen()) return 0;
-        long running = Math.max(0, startedTicks - snapshotTicks);
+        if (!serverRunsOnWallClock || server == null || server.tickRateManager().isFrozen()) {
+            return new ClickTiming(0, java.util.List.of(), Long.MAX_VALUE);
+        }
+        // Ticks started but not yet in the snapshot: one running, or just finished.
+        long running = Math.max(0, startedTicks - ticksApplied);
         long nextStart = tickStartNanos + serverTickNanos;
         if (NEXT_TICK_TIME != null) {
             try {
@@ -180,17 +217,73 @@ final class SulfurSyncedState {
         // including when the client is behind and runs ticks back to back.
         float partial = client.getDeltaTracker().getGameTimeDeltaPartialTick(true);
         long click = now + (long) ((1.0F - Math.min(1.0F, Math.max(0.0F, partial))) * CLIENT_TICK_NANOS);
-        long scheduled = click < nextStart ? 0 : 1 + (click - nextStart) / serverTickNanos;
-        return (int) Math.min(MAX_CATCH_UP_TICKS, running + scheduled);
+        // Walk the server's upcoming tick starts. A tick starts at its scheduled
+        // time, or as soon as the previous one ends when the server is running
+        // late; a lagging server's ticks take their measured duration.
+        long duration = (long) tickDurationNanos;
+        long schedule = nextStart;
+        long start = running > 0 ? Math.max(Math.max(tickStartNanos + duration, now), schedule)
+                : Math.max(schedule, now);
+        long previousStart = Long.MIN_VALUE;
+        int ahead = (int) running;
+        while (start <= click && ahead < MAX_CATCH_UP_TICKS) {
+            ahead++;
+            previousStart = start;
+            schedule += serverTickNanos;
+            start = Math.max(start + duration, schedule);
+        }
+        long untilNext = start - click;
+        long sincePrevious = previousStart == Long.MIN_VALUE ? Long.MAX_VALUE : click - previousStart;
+        // Irregular tick durations make each boundary less certain.
+        long window = Math.max(AMBIGUOUS_NANOS, (long) (2.0 * tickJitterNanos));
+        // Nearer boundary first; under heavy lag the window can reach both.
+        var alternates = new java.util.ArrayList<Integer>(2);
+        boolean later = untilNext < window && ahead < MAX_CATCH_UP_TICKS;
+        boolean earlier = sincePrevious < window && ahead > 0;
+        if (later && (!earlier || untilNext <= sincePrevious)) {
+            alternates.add(ahead + 1);
+            if (earlier) alternates.add(ahead - 1);
+        } else if (earlier) {
+            alternates.add(ahead - 1);
+            if (later) alternates.add(ahead + 1);
+        }
+        return new ClickTiming(ahead, java.util.List.copyOf(alternates), Math.min(untilNext, sincePrevious));
+    }
+
+    private java.util.List<Start> lastAlternates = java.util.List.of();
+    private ClickTiming lastTiming;
+
+    /**
+     * Starts for neighbouring server ticks the last {@link #start} click could
+     * also land on (nearest first), or empty when the timing is clear.
+     */
+    java.util.List<Start> alternates() {
+        return lastAlternates;
+    }
+
+    /** Test hook: the timing behind the last {@link #start}, or null outside singleplayer. */
+    ClickTiming lastTiming() {
+        return lastTiming;
     }
 
     Start start(SulfurCube cube) {
+        lastAlternates = java.util.List.of();
+        lastTiming = null;
         if (integrated()) {
-            ServerState server = integratedStates.get(cube.getUUID());
+            IntegratedSnapshot snapshot = integrated;
+            ServerState server = snapshot.states().get(cube.getUUID());
             if (server != null) {
                 AABB bounds = cube.getBoundingBox().move(server.position().subtract(cube.position()));
-                int ahead = integratedTicksBeforeClick();
-                return new Start(bounds, server.velocity(), server.onGround(), ahead, server.tickCount() + ahead);
+                ClickTiming timing = integratedClickTiming(snapshot.ticksApplied());
+                lastTiming = timing;
+                var alternates = new java.util.ArrayList<Start>(2);
+                for (int ticks : timing.alternates()) {
+                    alternates.add(new Start(bounds, server.velocity(), server.onGround(), ticks,
+                            server.tickCount() + ticks));
+                }
+                lastAlternates = java.util.List.copyOf(alternates);
+                return new Start(bounds, server.velocity(), server.onGround(), timing.ahead(),
+                        server.tickCount() + timing.ahead());
             }
         }
         Snapshot live = Snapshot.of(cube);
@@ -266,8 +359,38 @@ final class SulfurSyncedState {
         return phase.get(cube);
     }
 
+    /**
+     * The part of the start state that changes where a hit lands. The tick count
+     * and click-timing catch-up advance 20 times a second; for a cube resting on
+     * the ground neither changes the outcome, so they must not restart the solve.
+     * A moving or floating cube really is changing, so its full state is used.
+     */
+    static Object outcomeKey(SulfurSyncedState.Start start) {
+        Vec3 velocity = start.velocity();
+        boolean settled = start.onGround() && Math.abs(velocity.x) < 1.0E-3 && Math.abs(velocity.z) < 1.0E-3
+                && Math.abs(velocity.y) < 0.1;
+        return settled ? java.util.List.of(roundBounds(start.bounds()), true) : start;
+    }
+
+    private static AABB roundBounds(AABB box) {
+        return new AABB(Math.round(box.minX * 1000) / 1000.0, Math.round(box.minY * 1000) / 1000.0,
+                Math.round(box.minZ * 1000) / 1000.0, Math.round(box.maxX * 1000) / 1000.0,
+                Math.round(box.maxY * 1000) / 1000.0, Math.round(box.maxZ * 1000) / 1000.0);
+    }
+
+    /** Whether two forecasts describe the same motion (e.g. a resting cube). */
+    static boolean samePath(dev.briefestboxer.core.Trajectory a, dev.briefestboxer.core.Trajectory b) {
+        var first = a.getPositions();
+        var second = b.getPositions();
+        int count = Math.min(first.size(), second.size());
+        for (int i = 0; i < count; i++) {
+            if (first.get(i).distanceSquared(second.get(i)) > 1.0E-8) return false;
+        }
+        return true;
+    }
+
     void clear() {
-        integratedStates = Map.of();
+        integrated = new IntegratedSnapshot(Map.of(), startedTicks);
         afterLastTick.clear();
         synced.clear();
         phase.clear();
