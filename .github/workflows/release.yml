@@ -83,3 +83,22 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: releases/${{ steps.release.outputs.version }}/*
+
+      - name: Publish to Modrinth
+        if: github.ref_type == 'tag' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+          MODRINTH_PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
+          BRIEFEST_BOXER_VERSION: ${{ steps.release.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if [[ -z "$MODRINTH_TOKEN" || -z "$MODRINTH_PROJECT_ID" ]]; then
+            echo "::warning::Skipping Modrinth upload: set the MODRINTH_TOKEN secret and MODRINTH_PROJECT_ID variable."
+            exit 0
+          fi
+          changelog="$RUNNER_TEMP/modrinth-changelog.md"
+          if ! gh release view "$GITHUB_REF_NAME" --json body -q .body > "$changelog" || [[ ! -s "$changelog" ]]; then
+            echo "See https://github.com/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME" > "$changelog"
+          fi
+          MODRINTH_CHANGELOG_FILE="$changelog" ./scripts/publish-modrinth.sh
