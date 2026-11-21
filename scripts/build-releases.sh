@@ -79,7 +79,7 @@ for project_dir in "$root_dir"/versions/*/fabric "$root_dir"/versions/*/forge; d
     minecraft_version="${project_dir#"$root_dir"/versions/}"
     minecraft_version="${minecraft_version%%/*}"
     case "$minecraft_version" in
-        1.21.8|1.21.10|1.20.2|1.20.4|1.20.6|1.21.3|1.21.4|1.21.5)
+        1.21.8|1.21.10|1.21.11|1.20.2|1.20.4|1.20.6|1.21.3|1.21.4|1.21.5)
             printf 'Skipping removed Minecraft target %s\n' "$minecraft_version"
             continue
             ;;
